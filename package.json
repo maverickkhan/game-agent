@@ -1,0 +1,24 @@
+{
+  "name": "game-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "agent.ts",
+  "scripts": {
+    "play": "tsx src/cli.ts",
+    "dev": "npx adk web",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/adk": "^0.3.0",
+    "@google/genai": "^1.35.0",
+    "dotenv": "^16.4.7",
+    "playwright": "^1.50.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@google/adk-devtools": "^0.3.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
