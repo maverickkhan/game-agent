@@ -282,30 +282,29 @@ Teardown: `browser.close()` in a `finally` block wrapping the entire runner exec
 unicostudio/
 ├── package.json
 ├── tsconfig.json
-├── .env                          # GEMINI_API_KEY
+├── .env                          # GOOGLE_GENAI_API_KEY (gitignored)
+├── .env.example                  # Template for env vars
 ├── agent.ts                      # ADK entry point (exports rootAgent)
 ├── src/
 │   ├── agents/
-│   │   ├── setup-agent.ts        # SetupAgent config + instruction
-│   │   ├── play-agent.ts         # PlayAgent config + instruction
-│   │   ├── finalize-agent.ts     # FinalizeAgent config + instruction
+│   │   ├── setup-agent.ts        # Custom BaseAgent — opens game, navigates menus
+│   │   ├── play-turn-agent.ts    # Custom BaseAgent — screenshot→vision→action loop
+│   │   ├── finalize-agent.ts     # Custom BaseAgent — saves artifacts & summary
 │   │   └── game-runner.ts        # SequentialAgent + LoopAgent composition
-│   ├── tools/
-│   │   ├── browser.ts            # Playwright lifecycle (launch, close, getPage)
-│   │   ├── screenshot.ts         # screenshot() FunctionTool
-│   │   ├── click.ts              # click() FunctionTool
-│   │   ├── drag.ts               # drag() FunctionTool
-│   │   ├── tap-hold.ts           # tapHold() FunctionTool
-│   │   ├── wait.ts               # wait() FunctionTool
-│   │   ├── open-game.ts          # openGame() FunctionTool
-│   │   ├── check-time.ts         # checkTime() FunctionTool
-│   │   └── save-summary.ts       # saveSummary() FunctionTool
+│   ├── browser.ts                # Playwright singleton (launch, getPage, close)
+│   ├── gemini.ts                 # Gemini client, function declarations, rate limiting
+│   ├── actions.ts                # Action execution (click, drag, tapHold, wait)
 │   ├── lib/
-│   │   ├── coords.ts             # normalize/denormalize helpers
-│   │   └── logger.ts             # action logging to JSONL
-│   └── cli.ts                    # CLI entry: parses args, runs agent
-├── ARCHITECTURE.md               # Diagram + explanation for eval
-└── artifacts/                    # Generated per run
+│   │   ├── coords.ts             # Coordinate normalization (0..1 → pixels)
+│   │   ├── game-state.ts         # Shared runtime state + timing helpers
+│   │   └── logger.ts             # JSONL action logger + screenshot saver
+│   └── cli.ts                    # CLI entry: arg parsing, browser launch, runner
+├── PLAN.md                       # This file
+└── artifacts/                    # Generated per run (gitignored)
+    └── run_<timestamp>/
+        ├── summary.json
+        ├── actions.jsonl
+        └── screens/
 ```
 
 ---
@@ -359,10 +358,46 @@ npx adk web agent.ts
 
 ## What This Plan Explicitly Does NOT Include
 
-- **OpenAI/Anthropic adapters** — not worth the effort when Gemini is native and meets requirements
 - **Frame-diff stuck detection** — model handles this visually; threshold tuning per game is fragile
 - **DOM/accessibility tools** — games are pure canvas, these return nothing useful
-- **Computer Use API (any provider)** — we define our own cleaner action contract via FunctionTools
 - **Golden dataset evaluation** — games are non-deterministic; eval is outcome-based (did it play? did it progress?)
 - **A2A protocols, Vertex deployment** — out of scope
 - **Database session persistence** — 2-minute in-memory session is fine
+
+---
+
+## Implementation Status
+
+### Completed (v1 — commit 781d789)
+
+- Full ADK TypeScript project with custom BaseAgent subclasses
+- SequentialAgent → LoopAgent → PlayTurnAgent orchestration
+- Playwright integration: click, drag, tapHold, wait with normalized 0..1 coords
+- Direct Gemini 2.5 Flash vision calls (multimodal: screenshot + text → function call)
+- Rate limiting (13s delay, 30-call hard cap) with fallback actions on 429
+- Artifact generation: screenshots, actions.jsonl, summary.json
+- CLI: `npm run play -- --url <url> --duration 120`
+
+### First Test Results (Gemini 2.5 Flash, free tier)
+
+| Metric | Result |
+|---|---|
+| Duration | 123s (target: 120s) |
+| Total actions | 27 (all successful) |
+| Gemini-guided actions | ~19 of 27 |
+| Fallback actions (429 errors) | ~8 of 27 |
+| Game understood | Yes — farm sim: joystick, scythe, money collection, building |
+| Rate limit | 5 RPM free tier, hit 429 on ~30% of calls |
+
+### Known Issues
+
+1. **Free tier rate limit (5 RPM)** — too restrictive for real-time gameplay. ~30% of actions are blind fallbacks.
+2. **Game type detection** — SetupAgent sometimes exhausts turns before calling `done_setup`, resulting in "unknown" game type.
+3. **No multi-model support yet** — only Gemini. Anthropic Claude would solve rate limits and improve vision accuracy.
+
+### Next Steps
+
+- [ ] Add Anthropic Claude API as alternative vision model (solves rate limits)
+- [ ] Add ARCHITECTURE.md for eval submission
+- [ ] Improve setup phase (fewer turns needed, faster game detection)
+- [ ] Test with additional game URLs

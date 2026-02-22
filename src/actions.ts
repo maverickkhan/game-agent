@@ -34,6 +34,7 @@ export async function executeAction(
           reason,
           timestamp,
           result: 'ok',
+          source: 'fallback',
         };
         logAction(record);
         return record;
@@ -51,6 +52,7 @@ export async function executeAction(
           reason,
           timestamp,
           result: 'ok',
+          source: 'fallback',
         };
         logAction(record);
         return record;
@@ -67,6 +69,7 @@ export async function executeAction(
           reason,
           timestamp,
           result: 'ok',
+          source: 'fallback',
         };
         logAction(record);
         return record;
@@ -81,6 +84,7 @@ export async function executeAction(
           reason,
           timestamp,
           result: 'ok',
+          source: 'fallback',
         };
         logAction(record);
         return record;
@@ -96,6 +100,7 @@ export async function executeAction(
           reason: 'Game setup complete',
           timestamp,
           result: 'ok',
+          source: 'fallback',
         };
         logAction(record);
         return record;
@@ -108,6 +113,7 @@ export async function executeAction(
           reason,
           timestamp,
           result: `error: unknown action "${name}"`,
+          source: 'fallback',
         };
         logAction(record);
         return record;
@@ -120,6 +126,7 @@ export async function executeAction(
       reason,
       timestamp,
       result: `error: ${err.message}`,
+      source: 'fallback',
     };
     logAction(record);
     return record;

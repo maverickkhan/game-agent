@@ -11,7 +11,7 @@ export function createGameRunner(): SequentialAgent {
   const gameplayLoop = new LoopAgent({
     name: 'GameplayLoop',
     subAgents: [playTurnAgent],
-    maxIterations: 25, // Conservative: stays within API budget
+    maxIterations: 80, // Flash-Lite has 1,000 RPD — time-based exit via escalation
   });
 
   const finalizeAgent = new FinalizeAgent();
