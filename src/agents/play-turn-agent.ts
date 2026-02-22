@@ -1,8 +1,8 @@
 import { BaseAgent, createEvent, createEventActions } from '@google/adk';
 import type { InvocationContext, Event } from '@google/adk';
-import { takeScreenshot, executeAction } from '../actions.js';
+import { takeScreenshot, executeAction, compressForApi } from '../actions.js';
 import { askGeminiForPlayAction, isApiBudgetExhausted, isAnyModelAvailable } from '../gemini.js';
-import { gameState, getElapsedMs, getRemainingMs, isTimeUp, learnFromApiAction, type ActionRecord } from '../lib/game-state.js';
+import { gameState, getElapsedMs, getRemainingMs, isTimeUp, learnFromApiAction, computeScreenHash, detectScreenChange, type ActionRecord } from '../lib/game-state.js';
 import { saveScreenshot } from '../lib/logger.js';
 import { getPage } from '../browser.js';
 
@@ -13,6 +13,16 @@ let lastActionTime = 0;
 // Direction memory: how many fallback turns to hold the last API-directed direction
 // 15 turns × ~1.5s each ≈ 22 seconds of sustained movement per API direction
 const DIRECTION_STALE_TURNS = 15;
+
+// Screen change tracking — how many consecutive turns with no visible change
+let unchangedTurns = 0;
+
+// Sliding window of compressed screenshots for temporal context (last 3 turns)
+const MAX_SCREENSHOT_HISTORY = 3;
+const screenshotHistory: string[] = [];
+
+// Progress tracking: last known score/observations from model
+let lastObservations: string | null = null;
 
 
 export class PlayTurnAgent extends BaseAgent {
@@ -51,6 +61,18 @@ export class PlayTurnAgent extends BaseAgent {
       saveScreenshot(screenshot, `play_${turnNumber}`);
     }
 
+    // Compress for API use (512px wide, JPEG q60 — ~85% smaller)
+    const compressed = await compressForApi(screenshot);
+
+    // Track screen changes between turns
+    const screenHash = computeScreenHash(screenshot);
+    const screenChanged = detectScreenChange(screenHash);
+    if (screenChanged) {
+      unchangedTurns = 0;
+    } else if (turnNumber > 0) {
+      unchangedTurns++;
+    }
+
     const canUseApi = isAnyModelAvailable() && !isApiBudgetExhausted();
 
     let fc: { name: string; args: Record<string, unknown> } | null = null;
@@ -79,7 +101,24 @@ export class PlayTurnAgent extends BaseAgent {
       contextParts.push(`⚠️ ARROWS/INDICATORS ON SCREEN = DIRECTION to move, NOT buttons. Use DRAG to move in the direction arrows point.`);
       contextParts.push(`🚫 NEVER click "Install", "Download", "Get it now", "Play Store", "App Store", or any store/ad buttons. These are AD CTAs — clicking them ENDS the game.`);
 
-      // Include recent action history with results so model learns what worked
+      // Explicit last-action feedback — did it work or not?
+      const lastAction = gameState.actions.length > 0 ? gameState.actions[gameState.actions.length - 1] : null;
+      if (lastAction) {
+        const lastCoords = lastAction.action === 'drag'
+          ? `from (${(lastAction.args?.startX as number)?.toFixed(2)}, ${(lastAction.args?.startY as number)?.toFixed(2)}) to (${(lastAction.args?.endX as number)?.toFixed(2)}, ${(lastAction.args?.endY as number)?.toFixed(2)})`
+          : `at (${(lastAction.args?.x as number)?.toFixed(2)}, ${(lastAction.args?.y as number)?.toFixed(2)})`;
+        contextParts.push('');
+        if (unchangedTurns > 0) {
+          contextParts.push(`LAST ACTION FEEDBACK: ❌ FAILED — "${lastAction.action} ${lastCoords}" had NO visible effect. The screen looks the SAME as before.`);
+          contextParts.push('Compare the PREVIOUS and CURRENT screenshots — they should look identical, proving your action did nothing.');
+          contextParts.push('You MUST choose a DIFFERENT action or position this turn.');
+        } else {
+          contextParts.push(`LAST ACTION FEEDBACK: ✅ SUCCESS — "${lastAction.action} ${lastCoords}" caused a visible change on screen.`);
+          contextParts.push('Compare the PREVIOUS and CURRENT screenshots to see what changed, and build on this progress.');
+        }
+      }
+
+      // Include recent action history
       const recentActions = gameState.actions.slice(-8);
       if (recentActions.length > 0) {
         contextParts.push('');
@@ -99,20 +138,53 @@ export class PlayTurnAgent extends BaseAgent {
         }
       }
 
+      // Screen change feedback — tell the model if its actions are having no effect
+      if (unchangedTurns >= 3) {
+        contextParts.push('');
+        contextParts.push(`🚨 SCREEN HAS NOT CHANGED in ${unchangedTurns} turns! Your actions are having NO VISIBLE EFFECT.`);
+        contextParts.push('You MUST try something COMPLETELY DIFFERENT:');
+        if (k.category === 'joystick' || k.joystickCenter) {
+          contextParts.push(`- The joystick position (${k.joystickCenter?.x.toFixed(2) ?? '?'}, ${k.joystickCenter?.y.toFixed(2) ?? '?'}) may be WRONG`);
+          contextParts.push('- Try dragging from DIFFERENT positions: bottom-right (0.80, 0.85), bottom-left (0.20, 0.85), or center-right (0.85, 0.60)');
+        }
+        contextParts.push('- Try CLICKING on objects/buttons you see on screen instead of dragging');
+        contextParts.push('- Try the OPPOSITE direction from what you have been doing');
+      } else if (unchangedTurns >= 1) {
+        contextParts.push('');
+        contextParts.push(`⚠️ Screen unchanged for ${unchangedTurns} turn(s). Consider trying a different action or position.`);
+      }
+
+      // Feed last known observations for progress tracking
+      if (lastObservations) {
+        contextParts.push('');
+        contextParts.push(`LAST OBSERVED STATE: ${lastObservations}`);
+        contextParts.push('Report any changes in numbers, score, money, or progress in the "observations" field.');
+      } else {
+        contextParts.push('');
+        contextParts.push('Report any visible numbers (score, money, level, timer) in the "observations" field so we can track progress.');
+      }
+
       contextParts.push('');
       contextParts.push('IMPORTANT: Look at the screenshot CAREFULLY. What EXACTLY is on screen right now?');
       contextParts.push('- Read ALL text and numbers visible on screen');
       contextParts.push('- If there is a button, icon, or highlighted area you have NOT tried, interact with it');
-      contextParts.push('- If you see the character is NOT moving despite drags, the joystick position may be wrong — try dragging from a different starting point');
       contextParts.push('- Do NOT repeat the same action if the screen has not changed');
 
       const contextText = contextParts.join('\n');
 
       try {
-        fc = await askGeminiForPlayAction(screenshot, contextText);
+        fc = await askGeminiForPlayAction(compressed, contextText, screenshotHistory);
         if (fc) {
           source = 'api';
           learnFromApiAction(fc, turnNumber);
+          // Track observations for progress
+          if (fc.args.observations && typeof fc.args.observations === 'string') {
+            const obs = fc.args.observations as string;
+            if (obs !== lastObservations) {
+              console.log(`[Progress] ${lastObservations ? lastObservations + ' → ' : ''}${obs}`);
+              lastObservations = obs;
+            }
+          }
         }
       } catch (err: any) {
         const short = err.message?.includes('429') ? '429 rate limited' : err.message?.slice(0, 80);
@@ -130,6 +202,12 @@ export class PlayTurnAgent extends BaseAgent {
     result.source = source;
     gameState.actions.push(result);
     lastActionTime = Date.now();
+
+    // Add compressed screenshot to sliding window for temporal context
+    screenshotHistory.push(compressed);
+    if (screenshotHistory.length > MAX_SCREENSHOT_HISTORY) {
+      screenshotHistory.shift();
+    }
 
     const tag = source === 'api' ? '' : ` [${k.category}]`;
     console.log(
@@ -410,16 +488,29 @@ function detectStuckPattern(actions: ActionRecord[]): string | null {
     }
   }
 
-  // Check for repeated drags that aren't making progress (similar start/end)
+  // Check for repeated drags from similar start positions (coordinate-based, not reason-based)
   const drags = actions.filter(a => a.action === 'drag');
   if (drags.length >= 4) {
-    // Check if all drags are going in roughly the same direction
-    const reasons = drags.map(d => d.reason);
-    const uniqueReasons = new Set(reasons.map(r => r.slice(0, 30)));
-    if (uniqueReasons.size <= 2) {
-      return `⚠️ WARNING: Your last ${drags.length} drags all seem similar ("${reasons[0]?.slice(0, 40)}...").\n` +
-        `If the character is NOT visibly moving, the joystick position may be wrong.\n` +
-        `Try: CLICK on a nearby object/button instead, or DRAG from a DIFFERENT starting point.`;
+    // Group drags by start position proximity
+    const startClusters: { x: number; y: number; count: number }[] = [];
+    for (const d of drags) {
+      const sx = d.args?.startX as number;
+      const sy = d.args?.startY as number;
+      const existing = startClusters.find(c => Math.abs(c.x - sx) < 0.15 && Math.abs(c.y - sy) < 0.15);
+      if (existing) {
+        existing.count++;
+      } else {
+        startClusters.push({ x: sx, y: sy, count: 1 });
+      }
+    }
+    const bigCluster = startClusters.find(c => c.count >= 4);
+    if (bigCluster) {
+      return `🚨 STUCK: ${bigCluster.count} drags all starting from (~${bigCluster.x.toFixed(2)}, ~${bigCluster.y.toFixed(2)}) — the character is NOT moving!\n` +
+        `The joystick/drag start position is WRONG. You MUST try dragging from a DIFFERENT position:\n` +
+        `- Bottom-right: start from (0.80, 0.85)\n` +
+        `- Bottom-left: start from (0.20, 0.85)\n` +
+        `- Center-right: start from (0.85, 0.60)\n` +
+        `Or try CLICKING on objects/buttons instead of dragging.`;
     }
   }
 

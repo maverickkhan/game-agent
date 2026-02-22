@@ -135,6 +135,7 @@ export const ACTION_DECLARATIONS = [
         x: { type: 'number', description: 'Horizontal position (0.0 to 1.0)' },
         y: { type: 'number', description: 'Vertical position (0.0 to 1.0)' },
         reason: { type: 'string', description: 'Brief explanation of why clicking here' },
+        observations: { type: 'string', description: 'Visible numbers on screen: score, money, level, timer, counters. Example: "Money: $150, Level: 3, Timer: 45s". Report what you see NOW.' },
       },
       required: ['x', 'y', 'reason'],
     },
@@ -151,6 +152,7 @@ export const ACTION_DECLARATIONS = [
         endX: { type: 'number', description: 'End horizontal position (0.0 to 1.0)' },
         endY: { type: 'number', description: 'End vertical position (0.0 to 1.0)' },
         reason: { type: 'string', description: 'Brief explanation of the drag action' },
+        observations: { type: 'string', description: 'Visible numbers on screen: score, money, level, timer, counters. Example: "Money: $150, Level: 3, Timer: 45s". Report what you see NOW.' },
       },
       required: ['startX', 'startY', 'endX', 'endY', 'reason'],
     },
@@ -168,6 +170,7 @@ export const ACTION_DECLARATIONS = [
           description: 'Hold duration in milliseconds (100-3000)',
         },
         reason: { type: 'string', description: 'Brief explanation' },
+        observations: { type: 'string', description: 'Visible numbers on screen: score, money, level, timer, counters.' },
       },
       required: ['x', 'y', 'durationMs', 'reason'],
     },
@@ -181,6 +184,7 @@ export const ACTION_DECLARATIONS = [
       properties: {
         ms: { type: 'number', description: 'Milliseconds to wait (100-5000)' },
         reason: { type: 'string', description: 'Why waiting' },
+        observations: { type: 'string', description: 'Visible numbers on screen: score, money, level, timer, counters.' },
       },
       required: ['ms', 'reason'],
     },
@@ -357,20 +361,31 @@ export async function askGeminiForAction(
   return callGemini(contents, systemInstruction, functionDeclarations);
 }
 
-/** Single-turn API call for gameplay with rich text context (avoids Gemini multi-turn format issues) */
+/** Single-turn API call for gameplay with screenshot history for temporal context.
+ *  Sends up to 3 compressed frames so the model can see how the game evolved. */
 export async function askGeminiForPlayAction(
-  base64Screenshot: string,
-  contextText: string
+  currentScreenshot: string,
+  contextText: string,
+  screenshotHistory: string[] = []
 ): Promise<{ name: string; args: Record<string, unknown> } | null> {
-  const contents = [
-    {
-      role: 'user' as const,
-      parts: [
-        { text: contextText },
-        { inlineData: { data: base64Screenshot, mimeType: 'image/jpeg' } },
-      ],
-    },
+  const parts: any[] = [
+    { text: contextText },
   ];
+
+  // Send screenshot history (oldest first) for temporal context
+  // screenshotHistory contains past compressed frames (not including current)
+  if (screenshotHistory.length >= 2) {
+    parts.push({ text: 'SCREENSHOT FROM 2 TURNS AGO (reference):' });
+    parts.push({ inlineData: { data: screenshotHistory[screenshotHistory.length - 2], mimeType: 'image/jpeg' } });
+  }
+  if (screenshotHistory.length >= 1) {
+    parts.push({ text: 'PREVIOUS TURN SCREENSHOT (before your last action):' });
+    parts.push({ inlineData: { data: screenshotHistory[screenshotHistory.length - 1], mimeType: 'image/jpeg' } });
+  }
+  parts.push({ text: screenshotHistory.length > 0 ? 'CURRENT SCREENSHOT (after your last action — act on THIS):' : 'CURRENT SCREENSHOT:' });
+  parts.push({ inlineData: { data: currentScreenshot, mimeType: 'image/jpeg' } });
+
+  const contents = [{ role: 'user' as const, parts }];
   return callGemini(contents, PLAY_INSTRUCTION, ACTION_DECLARATIONS);
 }
 
