@@ -20,11 +20,11 @@ export async function takeScreenshot(label?: string): Promise<string> {
  * Compress a screenshot for API calls: resize to maxWidth and lower JPEG quality.
  * Reduces base64 size by ~85% (1024px q80 → 512px q60) for faster uploads.
  */
-export async function compressForApi(base64Jpeg: string, maxWidth = 512): Promise<string> {
+export async function compressForApi(base64Jpeg: string, maxWidth = 384): Promise<string> {
   const inputBuffer = Buffer.from(base64Jpeg, 'base64');
   const outputBuffer = await sharp(inputBuffer)
     .resize(maxWidth, null, { fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 60 })
+    .jpeg({ quality: 50 })
     .toBuffer();
   return outputBuffer.toString('base64');
 }

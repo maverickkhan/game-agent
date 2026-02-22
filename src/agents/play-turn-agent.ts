@@ -87,19 +87,38 @@ export class PlayTurnAgent extends BaseAgent {
         `TURN: ${turnNumber}`,
       ];
 
-      if (k.category !== 'unknown') {
-        contextParts.push(`DETECTED CONTROLS: ${k.category}`);
-      }
-      if (k.joystickCenter) {
-        contextParts.push(`JOYSTICK LOCATION: (${k.joystickCenter.x.toFixed(2)}, ${k.joystickCenter.y.toFixed(2)}) — DRAG from here to move`);
+      // Rich, game-type-specific control guidance
+      contextParts.push('');
+      if (k.joystickCenter || k.category === 'joystick') {
+        const jx = k.joystickCenter?.x.toFixed(2) ?? '~0.75';
+        const jy = k.joystickCenter?.y.toFixed(2) ?? '~0.75';
+        contextParts.push(`CONTROLS (drag-to-move game):`);
+        contextParts.push(`- DRAG from (${jx}, ${jy}) in the direction you want to move.`);
+        contextParts.push(`- Arrows on screen = DIRECTION to move, NOT buttons. Do NOT click arrows.`);
+        contextParts.push(`- Arrow RIGHT → drag right (increase X). Arrow LEFT → decrease X. Arrow UP → decrease Y.`);
+        contextParts.push(`- To REACH a target: DRAG toward it until your character arrives.`);
+        contextParts.push(`- To INTERACT with something: WALK INTO it. If that fails, CLICK it only after you are next to it.`);
+        contextParts.push(`- If clicking a spot 2+ times has no effect, you need to WALK INTO it instead.`);
+      } else if (k.category === 'tap') {
+        contextParts.push(`CONTROLS (tap game):`);
+        contextParts.push(`- TAP/CLICK on game objects to interact.`);
+        contextParts.push(`- Look for highlighted, glowing, or animated elements — those are interactive.`);
+        contextParts.push(`- If tapping has no effect, try DRAGGING or SWIPING instead.`);
+      } else if (k.category === 'drag') {
+        contextParts.push(`CONTROLS (drag/swipe game):`);
+        contextParts.push(`- DRAG objects or SWIPE in directions to interact.`);
+        contextParts.push(`- If dragging has no effect, try CLICKING on objects instead.`);
+      } else if (k.category === 'puzzle') {
+        contextParts.push(`CONTROLS (puzzle game):`);
+        contextParts.push(`- CLICK or DRAG puzzle pieces/elements to solve.`);
+        contextParts.push(`- Look for patterns: matching colors, shapes, or sequences.`);
       } else {
-        contextParts.push(`JOYSTICK LOCATION: unknown — try dragging from (~0.75, ~0.75) or (~0.2, ~0.8) to move`);
+        contextParts.push(`CONTROLS (not yet determined):`);
+        contextParts.push(`- Try BOTH clicking objects AND dragging to move.`);
+        contextParts.push(`- Observe what causes visible changes and repeat what works.`);
+        contextParts.push(`- Arrows on screen usually show DIRECTION to move, not things to click.`);
       }
-      if (k.controlScheme) {
-        contextParts.push(`CONTROL SCHEME: ${k.controlScheme}`);
-      }
-      contextParts.push(`⚠️ ARROWS/INDICATORS ON SCREEN = DIRECTION to move, NOT buttons. Use DRAG to move in the direction arrows point.`);
-      contextParts.push(`🚫 NEVER click "Install", "Download", "Get it now", "Play Store", "App Store", or any store/ad buttons. These are AD CTAs — clicking them ENDS the game.`);
+      contextParts.push(`🚫 NEVER click "Install", "Download", "Get it now", "Play Store", "App Store" — they END the game.`);
 
       // Explicit last-action feedback — did it work or not?
       const lastAction = gameState.actions.length > 0 ? gameState.actions[gameState.actions.length - 1] : null;
@@ -139,19 +158,17 @@ export class PlayTurnAgent extends BaseAgent {
       }
 
       // Screen change feedback — tell the model if its actions are having no effect
-      if (unchangedTurns >= 3) {
+      if (unchangedTurns >= 2) {
         contextParts.push('');
         contextParts.push(`🚨 SCREEN HAS NOT CHANGED in ${unchangedTurns} turns! Your actions are having NO VISIBLE EFFECT.`);
-        contextParts.push('You MUST try something COMPLETELY DIFFERENT:');
-        if (k.category === 'joystick' || k.joystickCenter) {
-          contextParts.push(`- The joystick position (${k.joystickCenter?.x.toFixed(2) ?? '?'}, ${k.joystickCenter?.y.toFixed(2) ?? '?'}) may be WRONG`);
-          contextParts.push('- Try dragging from DIFFERENT positions: bottom-right (0.80, 0.85), bottom-left (0.20, 0.85), or center-right (0.85, 0.60)');
-        }
-        contextParts.push('- Try CLICKING on objects/buttons you see on screen instead of dragging');
-        contextParts.push('- Try the OPPOSITE direction from what you have been doing');
+        contextParts.push('You are likely BLOCKED by an obstacle (wall, fence, object).');
+        contextParts.push('To get around it, move in a PERPENDICULAR direction first:');
+        contextParts.push('- If you were moving LEFT/RIGHT, try moving UP or DOWN first, then resume.');
+        contextParts.push('- If you were moving UP/DOWN, try moving LEFT or RIGHT first, then resume.');
+        contextParts.push('- Try a DIFFERENT action type (click instead of drag, or vice versa)');
       } else if (unchangedTurns >= 1) {
         contextParts.push('');
-        contextParts.push(`⚠️ Screen unchanged for ${unchangedTurns} turn(s). Consider trying a different action or position.`);
+        contextParts.push(`⚠️ Screen unchanged — you may be blocked by an obstacle. Try moving in a DIFFERENT direction to go around it.`);
       }
 
       // Feed last known observations for progress tracking
@@ -466,8 +483,7 @@ function detectStuckPattern(actions: ActionRecord[]): string | null {
 
   // Check for repeated clicks near same spot
   const clicks = actions.filter(a => a.action === 'click');
-  if (clicks.length >= 3) {
-    // Group clicks by proximity
+  if (clicks.length >= 2) {
     const clusters: { x: number; y: number; count: number }[] = [];
     for (const c of clicks) {
       const cx = c.args?.x as number;
@@ -479,19 +495,40 @@ function detectStuckPattern(actions: ActionRecord[]): string | null {
         clusters.push({ x: cx, y: cy, count: 1 });
       }
     }
-    const bigCluster = clusters.find(c => c.count >= 3);
+    const bigCluster = clusters.find(c => c.count >= 2);
     if (bigCluster) {
-      return `🚨 STUCK: You clicked near (${bigCluster.x.toFixed(2)}, ${bigCluster.y.toFixed(2)}) ${bigCluster.count} times! This is NOT working. You MUST try something COMPLETELY DIFFERENT:\n` +
-        `- If this is a joystick game: DRAG from the joystick to MOVE the character FIRST, then interact\n` +
+      return `🚨 STUCK: You clicked near (${bigCluster.x.toFixed(2)}, ${bigCluster.y.toFixed(2)}) ${bigCluster.count} times with no effect.\n` +
+        `You MUST try something COMPLETELY DIFFERENT:\n` +
+        `- Try DRAGGING to move your character to a new position first\n` +
         `- Try a DIFFERENT part of the screen entirely\n` +
         `- Look for NEW interactive elements you haven't tried`;
     }
   }
 
-  // Check for repeated drags from similar start positions (coordinate-based, not reason-based)
+  // Check for repeated drags in the same direction (wall/obstacle detection)
   const drags = actions.filter(a => a.action === 'drag');
-  if (drags.length >= 4) {
-    // Group drags by start position proximity
+  if (drags.length >= 2) {
+    // Check last 2+ drags for same direction
+    const lastDrags = drags.slice(-3);
+    const directions = lastDrags.map(d => {
+      const dx = (d.args?.endX as number) - (d.args?.startX as number);
+      const dy = (d.args?.endY as number) - (d.args?.startY as number);
+      const angle = Math.atan2(dy, dx);
+      return Math.round(angle / (Math.PI / 4)); // Quantize to 8 directions
+    });
+    // If last 2+ drags are in the same direction
+    if (directions.length >= 2 && directions.slice(-2).every(d => d === directions[directions.length - 1])) {
+      const dirNames = ['right', 'down-right', 'down', 'down-left', 'left', 'up-left', 'up', 'up-right'];
+      const dirIdx = ((directions[directions.length - 1] % 8) + 8) % 8;
+      const perpDirs = dirIdx % 2 === 0
+        ? [dirNames[(dirIdx + 2) % 8], dirNames[(dirIdx + 6) % 8]]
+        : [dirNames[(dirIdx + 2) % 8], dirNames[(dirIdx + 6) % 8]];
+      return `⚠️ BLOCKED: You dragged ${dirNames[dirIdx]} ${directions.length} times but the screen didn't change.\n` +
+        `You are likely hitting a wall or obstacle. To get AROUND it:\n` +
+        `- Try moving ${perpDirs[0]} or ${perpDirs[1]} first, THEN resume toward your target.`;
+    }
+
+    // Also check for drags from same start position
     const startClusters: { x: number; y: number; count: number }[] = [];
     for (const d of drags) {
       const sx = d.args?.startX as number;
@@ -503,14 +540,13 @@ function detectStuckPattern(actions: ActionRecord[]): string | null {
         startClusters.push({ x: sx, y: sy, count: 1 });
       }
     }
-    const bigCluster = startClusters.find(c => c.count >= 4);
+    const bigCluster = startClusters.find(c => c.count >= 3);
     if (bigCluster) {
-      return `🚨 STUCK: ${bigCluster.count} drags all starting from (~${bigCluster.x.toFixed(2)}, ~${bigCluster.y.toFixed(2)}) — the character is NOT moving!\n` +
-        `The joystick/drag start position is WRONG. You MUST try dragging from a DIFFERENT position:\n` +
-        `- Bottom-right: start from (0.80, 0.85)\n` +
-        `- Bottom-left: start from (0.20, 0.85)\n` +
-        `- Center-right: start from (0.85, 0.60)\n` +
-        `Or try CLICKING on objects/buttons instead of dragging.`;
+      return `🚨 STUCK: ${bigCluster.count} drags all starting from (~${bigCluster.x.toFixed(2)}, ~${bigCluster.y.toFixed(2)}) with no progress.\n` +
+        `Your drag starting position is not working. Try something different:\n` +
+        `- Drag from a DIFFERENT area of the screen\n` +
+        `- Try CLICKING on objects/buttons instead of dragging\n` +
+        `- Look at the screenshot — what interactive elements do you see?`;
     }
   }
 

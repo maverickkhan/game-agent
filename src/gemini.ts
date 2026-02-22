@@ -6,8 +6,8 @@ import { GoogleGenAI, FunctionCallingConfigMode } from '@google/genai';
 // Paid tier limits: Flash=1K RPM/10K RPD, Flash-Lite=4K RPM/Unlimited, Pro=150 RPM/1K RPD
 
 const MODELS = [
-  'gemini-2.5-flash',        // 1K RPM — consistently fast (4-5s/turn)
-  'gemini-3-flash-preview',  // 1K RPM — better quality but variable latency
+  'gemini-2.5-pro',                  // Best quality for gameplay decisions
+  'gemini-2.5-flash',              // 1K RPM — fast fallback
 ] as const;
 
 interface ApiSlot {
@@ -316,29 +316,31 @@ export const GAME_ANALYSIS_DECLARATION = [
   },
 ];
 
-export const PLAY_INSTRUCTION = `You are an expert game player. Your goal is to ACTIVELY PLAY the game and make real progress.
+export const PLAY_INSTRUCTION = `You are an expert game player. Maximize score and progress in any game.
 
-NEVER click "Install"/"Download"/"Get" buttons — they are ads.
+NEVER click "Install"/"Download"/"Get" buttons — they are ads that end the game.
 
-CRITICAL — ARROWS AND INDICATORS:
-- Blue/colored ARROWS on the game screen are DIRECTION INDICATORS, not buttons.
-- Do NOT click arrows. They show you WHERE TO MOVE, not what to tap.
-- To follow an arrow: use DRAG action in the direction the arrow points.
+EVERY TURN:
+1. Compare previous screenshot to current — what CHANGED?
+2. Report visible numbers (score, money, level) in the "observations" field.
+3. If no progress in 3+ turns, CHANGE your approach entirely.
 
-CRITICAL — MOVEMENT:
-- Most games use a JOYSTICK or DRAG for movement. If you see a character and arrows:
-  1. Look for a joystick circle (often bottom-left or bottom-right of screen).
-  2. DRAG from the joystick center in the direction you want to move.
-  3. If JOYSTICK LOCATION is given in context, ALWAYS drag from that exact position.
-  4. If no joystick location is known, try dragging from bottom-right (~0.75, 0.75) or bottom-left (~0.2, 0.8).
-- DRAG DIRECTION: arrow points RIGHT → drag joystick RIGHT (increase X). Arrow LEFT → decrease X. Arrow DOWN → increase Y.
-- After reaching a destination, CLICK on nearby objects (buildings, items, NPCs) to interact.
+CONTROLS:
+- Follow the CONTROLS section in the turn context — it explains how THIS game works.
+- If an action produces no visible change, STOP repeating it and try something different.
+- If clicking the same spot 2+ times has no effect, it's not interactive.
 
-CRITICAL — STUCK DETECTION:
-- If clicking the same spot 2+ times has no effect, STOP. It's not interactive.
-- If the screen hasn't changed after 3 actions, try a completely DIFFERENT action type (switch from click to drag, or drag in the opposite direction).
+ACTION SELECTION:
+- DRAG = movement, navigating your character to a new position.
+- CLICK = interact with UI buttons or objects you are already next to.
+- To REACH something: DRAG/move toward it first.
+- To INTERACT: WALK INTO it first. Only CLICK if walking into it fails.
 
-Each turn: Look at the screenshot. What changed since last turn? Choose an action that makes PROGRESS.
+STRATEGY:
+- Have a clear sub-goal each turn.
+- If it fails after 3 tries, abandon it and try something new.
+- After completing a goal, look for the NEXT hint: arrows, glowing areas, new objects.
+- Explore new areas when stuck.
 
 Coordinates: (0,0)=top-left, (1,1)=bottom-right.`;
 
