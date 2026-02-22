@@ -1,14 +1,13 @@
 import { GoogleGenAI, FunctionCallingConfigMode } from '@google/genai';
 
-// ── Multi-key × multi-model slot pool ──
+// ── Multi-key × multi-model slot pool (Paid Tier) ──
 // Each API key × model combination is a "slot" with independent rate limits.
 // On 429, that specific slot is marked unavailable; the system rotates to the next.
-// This maximizes throughput across multiple free-tier keys.
+// Paid tier limits: Flash=1K RPM/10K RPD, Flash-Lite=4K RPM/Unlimited, Pro=150 RPM/1K RPD
 
 const MODELS = [
-  'gemini-2.5-flash',       // 5 RPM, 20 RPD per key
-  'gemini-2.5-flash-lite',  // 10 RPM, 20 RPD per key
-  'gemini-2.0-flash',       // May have separate quota
+  'gemini-2.5-flash',        // 1K RPM — consistently fast (4-5s/turn)
+  'gemini-3-flash-preview',  // 1K RPM — better quality but variable latency
 ] as const;
 
 interface ApiSlot {
@@ -19,7 +18,6 @@ interface ApiSlot {
 }
 
 const slots: ApiSlot[] = [];
-let slotIndex = 0;
 
 function loadApiKeys(): string[] {
   // Preferred: comma-separated list in GEMINI_API_KEYS
@@ -42,10 +40,16 @@ function initSlots(): void {
     );
   }
 
-  for (let k = 0; k < keys.length; k++) {
-    const client = new GoogleGenAI({ apiKey: keys[k] });
-    const label = keys.length > 1 ? `key${k + 1}` : 'key';
-    for (const model of MODELS) {
+  // Build clients once per key
+  const clients = keys.map((apiKey, i) => ({
+    client: new GoogleGenAI({ apiKey }),
+    label: keys.length > 1 ? `key${i + 1}` : 'key',
+  }));
+
+  // Model-first ordering: best model across ALL keys before falling back to weaker models.
+  // This ensures key1/flash → key2/flash → key3/flash → key4/flash → key1/flash-lite → ...
+  for (const model of MODELS) {
+    for (const { client, label } of clients) {
       slots.push({ client, model, keyLabel: label, availableAt: 0 });
     }
   }
@@ -53,48 +57,46 @@ function initSlots(): void {
   console.log(
     `[Gemini] Initialized ${keys.length} API key(s) × ${MODELS.length} models = ${slots.length} slots`
   );
+  console.log(`[Gemini] Rotation order: ${slots.map(s => `${s.keyLabel}/${s.model.replace('gemini-', '')}`).join(' → ')}`);
 }
 
 function getNextAvailableSlot(): ApiSlot | null {
   initSlots();
   const now = Date.now();
+  // Always try the best model first (index 0). Only fall to worse models if better ones are unavailable.
   for (let i = 0; i < slots.length; i++) {
-    const idx = (slotIndex + i) % slots.length;
-    if (now >= slots[idx].availableAt) {
-      slotIndex = (idx + 1) % slots.length;
-      return slots[idx];
+    if (now >= slots[i].availableAt) {
+      return slots[i];
     }
   }
   return null;
 }
 
 function markSlotRateLimited(slot: ApiSlot, retryDelayMs: number): void {
-  // Google's quota is per-API-KEY, not per-model.
-  // When one model on a key gets 429, mark ALL models for that key.
-  const until = Date.now() + retryDelayMs;
-  let markedCount = 0;
-  for (const s of slots) {
-    if (s.keyLabel === slot.keyLabel && s.availableAt < until) {
-      s.availableAt = until;
-      markedCount++;
-    }
-  }
+  // Rate limits are per-model per-key (e.g. Flash=5 RPM, Flash Lite=10 RPM).
+  // Only mark the specific slot that got 429'd, not other models on the same key.
+  slot.availableAt = Date.now() + retryDelayMs;
   const secs = Math.round(retryDelayMs / 1000);
-  console.log(`[RateLimit] ${slot.keyLabel} rate-limited for ${secs}s (all ${markedCount} models)`);
+  console.log(`[RateLimit] ${slot.keyLabel}/${slot.model} rate-limited for ${secs}s`);
 }
 
 function parseRetryDelay(errorMessage: string): number {
-  // Parse "retryDelay":"51s" or "Please retry in 51.748788721s"
-  const match = errorMessage.match(/retry\s*(?:in|Delay['":]?\s*['":]?)\s*(\d+(?:\.\d+)?)\s*s/i);
-  if (match) return Math.ceil(parseFloat(match[1]) * 1000);
-  return 60_000; // Default 60s if unparseable
+  // Parse "retryDelay":"51s" or "Please retry in 51.748788721s" or "retry after 30s"
+  const match = errorMessage.match(/retry\s*(?:in|after|Delay['":]?\s*['":]?)\s*(\d+(?:\.\d+)?)\s*s/i);
+  if (match) {
+    const parsed = Math.ceil(parseFloat(match[1]) * 1000);
+    console.log(`[RateLimit] Parsed retry delay: ${Math.round(parsed / 1000)}s`);
+    return parsed;
+  }
+  console.log(`[RateLimit] Could not parse retry delay from error, using default 20s. Error snippet: "${errorMessage.slice(0, 120)}"`);
+  return 20_000; // Default 20s — conservative enough but not wasteful for a 2-min session
 }
 
-// Rate limiting: enforce minimum delay between calls
+// Rate limiting: enforce minimum delay between SUCCESSFUL calls only
 let lastCallTime = 0;
 let totalCalls = 0;
-const MIN_DELAY_MS = 2_000; // With multiple keys, we can rotate faster between different keys
-const MAX_TOTAL_CALLS = 50; // Conservative cap for total successful calls
+const MIN_DELAY_MS = 200; // Minimal gap — actual pace is governed by action interval (1.5s) + API latency
+const MAX_TOTAL_CALLS = 500; // Paid tier: effectively unlimited for a 2-min session
 
 export function getApiCallCount(): number {
   return totalCalls;
@@ -110,17 +112,16 @@ export function isAnyModelAvailable(): boolean {
   return slots.some((s) => now >= s.availableAt);
 }
 
-async function enforceRateLimit(): Promise<void> {
+/** Log which slots are available vs blocked (for debugging rotation) */
+function logSlotStatus(): void {
   const now = Date.now();
-  const elapsed = now - lastCallTime;
-  if (lastCallTime > 0 && elapsed < MIN_DELAY_MS) {
-    const waitTime = MIN_DELAY_MS - elapsed;
-    console.log(`[RateLimit] Waiting ${Math.round(waitTime / 1000)}s before next API call...`);
-    await new Promise((resolve) => setTimeout(resolve, waitTime));
-  }
-  lastCallTime = Date.now();
-  totalCalls++;
-  console.log(`[RateLimit] API call #${totalCalls}/${MAX_TOTAL_CALLS}`);
+  const available = slots.filter(s => now >= s.availableAt);
+  const blocked = slots.filter(s => now < s.availableAt);
+  const blockedInfo = blocked.map(s => {
+    const remainSec = Math.round((s.availableAt - now) / 1000);
+    return `${s.keyLabel}/${s.model.replace('gemini-', '')}(${remainSec}s)`;
+  });
+  console.log(`[Gemini] Slots: ${available.length} available, ${blocked.length} blocked${blocked.length > 0 ? ' [' + blockedInfo.join(', ') + ']' : ''}`);
 }
 
 export const ACTION_DECLARATIONS = [
@@ -389,7 +390,7 @@ export async function askGeminiForObservation(
   return callGemini(contents, OBSERVE_INSTRUCTION, GAME_ANALYSIS_DECLARATION);
 }
 
-/** Core API call shared by single-turn and multi-turn */
+/** Core API call — retries across all available slots on 429 before giving up */
 async function callGemini(
   contents: Array<{ role: string; parts: any[] }>,
   systemInstruction: string,
@@ -400,50 +401,95 @@ async function callGemini(
     return null;
   }
 
-  const slot = getNextAvailableSlot();
-  if (!slot) {
-    console.log(`[Gemini] All slots rate-limited. Skipping API call.`);
-    return null;
+  // Ensure slots are initialized before anything else
+  initSlots();
+
+  // Enforce minimum delay between SUCCESSFUL API calls (not retries)
+  const now = Date.now();
+  const elapsed = now - lastCallTime;
+  if (lastCallTime > 0 && elapsed < MIN_DELAY_MS) {
+    const waitTime = MIN_DELAY_MS - elapsed;
+    await new Promise((resolve) => setTimeout(resolve, waitTime));
   }
 
-  await enforceRateLimit();
-  console.log(`[Gemini] Using ${slot.keyLabel}/${slot.model}`);
+  logSlotStatus();
 
-  try {
-    const response = await slot.client.models.generateContent({
-      model: slot.model,
-      contents,
-      config: {
-        systemInstruction,
-        tools: [{ functionDeclarations }],
-        toolConfig: {
-          functionCallingConfig: {
-            mode: FunctionCallingConfigMode.ANY,
-          },
-        },
-        thinkingConfig: { thinkingBudget: 2048 },
-      },
-    });
+  // Try all available slots — on 429, immediately try the next one (no delay)
+  let attempts = 0;
+  const maxAttempts = slots.length;
 
-    const parts = response.candidates?.[0]?.content?.parts;
-    if (!parts) return null;
-
-    const fcPart = parts.find((p: any) => p.functionCall);
-    if (!fcPart?.functionCall) return null;
-
-    return {
-      name: fcPart.functionCall.name ?? '',
-      args: (fcPart.functionCall.args as Record<string, unknown>) ?? {},
-    };
-  } catch (err: any) {
-    const msg = err.message || '';
-    if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
-      const retryMs = parseRetryDelay(msg);
-      markSlotRateLimited(slot, retryMs);
-      // Don't count rate-limited calls against the budget — they never reached the model
-      totalCalls = Math.max(0, totalCalls - 1);
-      console.log(`[RateLimit] 429 doesn't count against budget. Effective calls: ${totalCalls}/${MAX_TOTAL_CALLS}`);
+  while (attempts < maxAttempts) {
+    const slot = getNextAvailableSlot();
+    if (!slot) {
+      console.log(`[Gemini] All slots exhausted after ${attempts} attempt(s). Falling back.`);
+      return null;
     }
-    throw err;
+
+    attempts++;
+    totalCalls++;
+    console.log(`[Gemini] → ${slot.keyLabel}/${slot.model} (attempt ${attempts})`);
+
+    try {
+      const response = await slot.client.models.generateContent({
+        model: slot.model,
+        contents,
+        config: {
+          systemInstruction,
+          tools: [{ functionDeclarations }],
+          toolConfig: {
+            functionCallingConfig: {
+              mode: FunctionCallingConfigMode.ANY,
+            },
+          },
+          thinkingConfig: { thinkingBudget: 512 },
+        },
+      });
+
+      // Success — update timing
+      lastCallTime = Date.now();
+      console.log(`[Gemini] ✓ ${slot.keyLabel}/${slot.model} succeeded (call #${totalCalls}/${MAX_TOTAL_CALLS})`);
+
+      const parts = response.candidates?.[0]?.content?.parts;
+      if (!parts) return null;
+
+      const fcPart = parts.find((p: any) => p.functionCall);
+      if (!fcPart?.functionCall) return null;
+
+      return {
+        name: fcPart.functionCall.name ?? '',
+        args: (fcPart.functionCall.args as Record<string, unknown>) ?? {},
+      };
+    } catch (err: any) {
+      const msg = err.message || '';
+      totalCalls = Math.max(0, totalCalls - 1);
+
+      if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+        const retryMs = parseRetryDelay(msg);
+        markSlotRateLimited(slot, retryMs);
+        continue;
+      }
+
+      if (msg.includes('404') || msg.includes('not found')) {
+        // Model doesn't exist — permanently disable this slot
+        slot.availableAt = Infinity;
+        console.log(`[Gemini] ✗ ${slot.keyLabel}/${slot.model} not found — permanently disabled`);
+        continue;
+      }
+
+      if (msg.includes('503') || msg.includes('overloaded') || msg.includes('high demand')) {
+        // Temporary server issue — cool off for 10s
+        markSlotRateLimited(slot, 10_000);
+        console.log(`[Gemini] ✗ ${slot.keyLabel}/${slot.model} overloaded — trying next slot`);
+        continue;
+      }
+
+      // Unknown error — still try next slot instead of throwing
+      console.log(`[Gemini] ✗ ${slot.keyLabel}/${slot.model} error: ${msg.slice(0, 100)} — trying next slot`);
+      markSlotRateLimited(slot, 15_000);
+      continue;
+    }
   }
+
+  console.log(`[Gemini] Tried all ${maxAttempts} slots, all rate-limited. Falling back.`);
+  return null;
 }

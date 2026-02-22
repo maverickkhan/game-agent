@@ -2,13 +2,17 @@ import { BaseAgent, createEvent, createEventActions } from '@google/adk';
 import type { InvocationContext, Event } from '@google/adk';
 import { takeScreenshot, executeAction } from '../actions.js';
 import { askGeminiForPlayAction, isApiBudgetExhausted, isAnyModelAvailable } from '../gemini.js';
-import { gameState, getElapsedMs, getRemainingMs, isTimeUp, learnFromApiAction } from '../lib/game-state.js';
+import { gameState, getElapsedMs, getRemainingMs, isTimeUp, learnFromApiAction, type ActionRecord } from '../lib/game-state.js';
 import { saveScreenshot } from '../lib/logger.js';
 import { getPage } from '../browser.js';
 
 // Minimum time between actions — prevents unrealistic spam
 const MIN_ACTION_INTERVAL_MS = 1_500;
 let lastActionTime = 0;
+
+// Direction memory: how many fallback turns to hold the last API-directed direction
+// 15 turns × ~1.5s each ≈ 22 seconds of sustained movement per API direction
+const DIRECTION_STALE_TURNS = 15;
 
 
 export class PlayTurnAgent extends BaseAgent {
@@ -73,40 +77,34 @@ export class PlayTurnAgent extends BaseAgent {
         contextParts.push(`CONTROL SCHEME: ${k.controlScheme}`);
       }
       contextParts.push(`⚠️ ARROWS/INDICATORS ON SCREEN = DIRECTION to move, NOT buttons. Use DRAG to move in the direction arrows point.`);
+      contextParts.push(`🚫 NEVER click "Install", "Download", "Get it now", "Play Store", "App Store", or any store/ad buttons. These are AD CTAs — clicking them ENDS the game.`);
 
       // Include recent action history with results so model learns what worked
-      const recentActions = gameState.actions.slice(-5);
+      const recentActions = gameState.actions.slice(-8);
       if (recentActions.length > 0) {
         contextParts.push('');
         contextParts.push('RECENT ACTION HISTORY (learn from what worked/failed):');
         for (const a of recentActions) {
           const coords = a.action === 'drag'
-            ? `from (${a.args?.startX}, ${a.args?.startY}) to (${a.args?.endX}, ${a.args?.endY})`
-            : `at (${a.args?.x}, ${a.args?.y})`;
-          const status = a.result === 'ok' ? 'OK' : `FAILED: ${a.result}`;
-          contextParts.push(`  ${a.action} ${coords} — "${a.reason}" → ${status}`);
+            ? `from (${(a.args?.startX as number)?.toFixed(2)}, ${(a.args?.startY as number)?.toFixed(2)}) to (${(a.args?.endX as number)?.toFixed(2)}, ${(a.args?.endY as number)?.toFixed(2)})`
+            : `at (${(a.args?.x as number)?.toFixed(2)}, ${(a.args?.y as number)?.toFixed(2)})`;
+          contextParts.push(`  ${a.action} ${coords} — "${a.reason}"`);
         }
 
-        // Count repeated clicks on same spot
-        const clickActions = recentActions.filter(a => a.action === 'click');
-        if (clickActions.length >= 3) {
-          const sameSpot = clickActions.every(a =>
-            Math.abs((a.args?.x as number) - (clickActions[0].args?.x as number)) < 0.1 &&
-            Math.abs((a.args?.y as number) - (clickActions[0].args?.y as number)) < 0.1
-          );
-          if (sameSpot) {
-            contextParts.push('');
-            contextParts.push('⚠️ WARNING: You have been clicking the SAME SPOT repeatedly without progress!');
-            contextParts.push('STOP clicking there. Try a COMPLETELY DIFFERENT action:');
-            contextParts.push('- Use DRAG to move the joystick (if this is a movement game)');
-            contextParts.push('- Try interacting with a DIFFERENT element on screen');
-            contextParts.push('- Use tap_hold instead of click');
-          }
+        // Detect repeated action patterns (same action type + similar coords)
+        const stuckAnalysis = detectStuckPattern(recentActions);
+        if (stuckAnalysis) {
+          contextParts.push('');
+          contextParts.push(stuckAnalysis);
         }
       }
 
       contextParts.push('');
-      contextParts.push('Look at the screenshot. What do you see? What is the game asking you to do? Choose the BEST action.');
+      contextParts.push('IMPORTANT: Look at the screenshot CAREFULLY. What EXACTLY is on screen right now?');
+      contextParts.push('- Read ALL text and numbers visible on screen');
+      contextParts.push('- If there is a button, icon, or highlighted area you have NOT tried, interact with it');
+      contextParts.push('- If you see the character is NOT moving despite drags, the joystick position may be wrong — try dragging from a different starting point');
+      contextParts.push('- Do NOT repeat the same action if the screen has not changed');
 
       const contextText = contextParts.join('\n');
 
@@ -114,7 +112,7 @@ export class PlayTurnAgent extends BaseAgent {
         fc = await askGeminiForPlayAction(screenshot, contextText);
         if (fc) {
           source = 'api';
-          learnFromApiAction(fc);
+          learnFromApiAction(fc, turnNumber);
         }
       } catch (err: any) {
         const short = err.message?.includes('429') ? '429 rate limited' : err.message?.slice(0, 80);
@@ -168,19 +166,21 @@ function getAdaptiveFallback(
 ): { name: string; args: Record<string, unknown> } {
   const k = gameState.learned;
 
-  // Joystick games: primarily drag the joystick, occasionally click interactive spots
+  // Joystick games: primarily drag the joystick, occasionally tap interactive spots
   if (k.category === 'joystick' || k.joystickCenter) {
-    // Every 4th turn, click a known interactive area (if any) — we may have walked to something
-    if (turnNumber % 4 === 3 && k.interactiveAreas.length > 0) {
-      const area = k.interactiveAreas[turnNumber % k.interactiveAreas.length];
-      return {
-        name: 'click',
-        args: {
-          x: clamp(area.x + (Math.random() - 0.5) * 0.08),
-          y: clamp(area.y + (Math.random() - 0.5) * 0.08),
-          reason: 'Joystick game: tap nearby object after moving',
-        },
-      };
+    if (shouldTapNow(turnNumber) && k.interactiveAreas.length > 0) {
+      const target = pickBestTapTarget(turnNumber);
+      if (target) {
+        target.lastTappedTurn = turnNumber;
+        return {
+          name: 'click',
+          args: {
+            x: clamp(target.x + (Math.random() - 0.5) * 0.08),
+            y: clamp(target.y + (Math.random() - 0.5) * 0.08),
+            reason: `Joystick game: tap target (last tapped turn ${target.lastTappedTurn === turnNumber ? 'now' : target.lastTappedTurn})`,
+          },
+        };
+      }
     }
     return joystickFallback(turnNumber);
   }
@@ -251,12 +251,30 @@ function joystickFallback(turnNumber: number): { name: string; args: Record<stri
     }
   }
 
-  // Cycle through 8 directions, hold each direction for 2 turns before rotating.
-  // This gives the character time to actually travel in one direction before switching.
+  const jitter = (Math.random() - 0.5) * 0.02;
+
+  // Direction memory: continue API-directed movement when fresh
+  if (k.lastApiDirection) {
+    const turnsSinceSet = turnNumber - k.lastApiDirection.setAtTurn;
+    if (turnsSinceSet < DIRECTION_STALE_TURNS) {
+      // Fresh: continue in the API-directed direction
+      const hold = turnsSinceSet + 1;
+      const dirName = vectorToDirectionName(k.lastApiDirection.dx, k.lastApiDirection.dy);
+      return {
+        name: 'drag',
+        args: {
+          startX: jx, startY: jy,
+          endX: clamp(jx + k.lastApiDirection.dx + jitter),
+          endY: clamp(jy + k.lastApiDirection.dy + jitter),
+          reason: `Joystick: move ${dirName} (API-directed, hold ${hold}/${DIRECTION_STALE_TURNS})`,
+        },
+      };
+    }
+  }
+
+  // No fresh API direction: cycle through 8 directions, 2 turns each
   const dirIndex = Math.floor(turnNumber / 2) % JOYSTICK_DIRECTIONS.length;
   const dir = JOYSTICK_DIRECTIONS[dirIndex];
-  // Add slight jitter so we don't repeat exact pixel coords
-  const jitter = (Math.random() - 0.5) * 0.02;
 
   return {
     name: 'drag',
@@ -272,16 +290,18 @@ function joystickFallback(turnNumber: number): { name: string; args: Record<stri
 function tapFallback(turnNumber: number): { name: string; args: Record<string, unknown> } {
   const k = gameState.learned;
   if (k.interactiveAreas.length > 0) {
-    const sorted = [...k.interactiveAreas].sort((a, b) => b.count - a.count);
-    const area = sorted[turnNumber % sorted.length];
-    return {
-      name: 'click',
-      args: {
-        x: clamp(area.x + (Math.random() - 0.5) * 0.1),
-        y: clamp(area.y + (Math.random() - 0.5) * 0.1),
-        reason: `Adaptive: tap known area`,
-      },
-    };
+    const target = pickBestTapTarget(turnNumber);
+    if (target) {
+      target.lastTappedTurn = turnNumber;
+      return {
+        name: 'click',
+        args: {
+          x: clamp(target.x + (Math.random() - 0.5) * 0.1),
+          y: clamp(target.y + (Math.random() - 0.5) * 0.1),
+          reason: `Adaptive: tap target (priority-based)`,
+        },
+      };
+    }
   }
   return explorationFallback(turnNumber);
 }
@@ -358,7 +378,102 @@ function explorationFallback(turnNumber: number): { name: string; args: Record<s
 
 function clamp(v: number): number { return Math.max(0.05, Math.min(0.95, v)); }
 
-function directionName(angle: number): string {
+/** Detect if the agent is stuck repeating similar actions */
+function detectStuckPattern(actions: ActionRecord[]): string | null {
+  if (actions.length < 4) return null;
+
+  // Count action types
+  const clickCount = actions.filter(a => a.action === 'click').length;
+  const dragCount = actions.filter(a => a.action === 'drag').length;
+
+  // Check for repeated clicks near same spot
+  const clicks = actions.filter(a => a.action === 'click');
+  if (clicks.length >= 3) {
+    // Group clicks by proximity
+    const clusters: { x: number; y: number; count: number }[] = [];
+    for (const c of clicks) {
+      const cx = c.args?.x as number;
+      const cy = c.args?.y as number;
+      const existing = clusters.find(cl => Math.abs(cl.x - cx) < 0.15 && Math.abs(cl.y - cy) < 0.15);
+      if (existing) {
+        existing.count++;
+      } else {
+        clusters.push({ x: cx, y: cy, count: 1 });
+      }
+    }
+    const bigCluster = clusters.find(c => c.count >= 3);
+    if (bigCluster) {
+      return `🚨 STUCK: You clicked near (${bigCluster.x.toFixed(2)}, ${bigCluster.y.toFixed(2)}) ${bigCluster.count} times! This is NOT working. You MUST try something COMPLETELY DIFFERENT:\n` +
+        `- If this is a joystick game: DRAG from the joystick to MOVE the character FIRST, then interact\n` +
+        `- Try a DIFFERENT part of the screen entirely\n` +
+        `- Look for NEW interactive elements you haven't tried`;
+    }
+  }
+
+  // Check for repeated drags that aren't making progress (similar start/end)
+  const drags = actions.filter(a => a.action === 'drag');
+  if (drags.length >= 4) {
+    // Check if all drags are going in roughly the same direction
+    const reasons = drags.map(d => d.reason);
+    const uniqueReasons = new Set(reasons.map(r => r.slice(0, 30)));
+    if (uniqueReasons.size <= 2) {
+      return `⚠️ WARNING: Your last ${drags.length} drags all seem similar ("${reasons[0]?.slice(0, 40)}...").\n` +
+        `If the character is NOT visibly moving, the joystick position may be wrong.\n` +
+        `Try: CLICK on a nearby object/button instead, or DRAG from a DIFFERENT starting point.`;
+    }
+  }
+
+  // Check if mixing clicks and drags without progress (oscillating)
+  if (clickCount >= 2 && dragCount >= 2 && actions.length >= 6) {
+    const pattern = actions.map(a => a.action === 'click' ? 'C' : 'D').join('');
+    if (pattern.includes('CDCD') || pattern.includes('DCDC')) {
+      return `⚠️ WARNING: You are alternating between click and drag without making progress.\n` +
+        `STOP and OBSERVE the screenshot carefully. What has ACTUALLY changed on screen?\n` +
+        `If nothing changed, you need a completely new approach.`;
+    }
+  }
+
+  return null;
+}
+
+/** Convert a direction vector to a human-readable name */
+function vectorToDirectionName(dx: number, dy: number): string {
+  const angle = Math.atan2(dy, dx); // radians, 0=right, PI/2=down
   const dirs = ['right', 'down-right', 'down', 'down-left', 'left', 'up-left', 'up', 'up-right'];
-  return dirs[Math.round(((angle % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2) / (Math.PI / 4)) % 8];
+  const idx = Math.round(((angle + Math.PI * 2) % (Math.PI * 2)) / (Math.PI / 4)) % 8;
+  return dirs[idx];
+}
+
+/** Pick the best tap target: prioritize untapped, then least recently tapped */
+function pickBestTapTarget(turnNumber: number): { x: number; y: number; count: number; lastTappedTurn: number } | null {
+  const k = gameState.learned;
+  if (k.interactiveAreas.length === 0) return null;
+
+  // Filter out areas tapped within last 2 turns (avoid spam)
+  const candidates = k.interactiveAreas.filter(a => turnNumber - a.lastTappedTurn >= 2 || a.lastTappedTurn === -1);
+
+  // If all were tapped recently, use the full list but deprioritize
+  const pool = candidates.length > 0 ? candidates : k.interactiveAreas;
+
+  // Sort: never-tapped first (lastTappedTurn === -1), then least recently tapped
+  const sorted = [...pool].sort((a, b) => {
+    if (a.lastTappedTurn === -1 && b.lastTappedTurn !== -1) return -1;
+    if (b.lastTappedTurn === -1 && a.lastTappedTurn !== -1) return 1;
+    return a.lastTappedTurn - b.lastTappedTurn;
+  });
+
+  return sorted[0];
+}
+
+/** Decide whether this fallback turn should be a tap (vs movement) */
+function shouldTapNow(turnNumber: number): boolean {
+  const k = gameState.learned;
+  if (k.interactiveAreas.length === 0) return false;
+
+  // If all areas have been tapped: less frequent (every 8th turn)
+  const untapped = k.interactiveAreas.filter(a => a.lastTappedTurn === -1);
+  if (untapped.length === 0) return turnNumber % 8 === 7;
+
+  // Normal: tap every 5th turn
+  return turnNumber % 5 === 4;
 }

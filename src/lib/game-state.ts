@@ -25,7 +25,7 @@ export interface LearnedKnowledge {
   // Successful actions the API chose (replay these during fallback)
   successfulActions: { name: string; args: Record<string, unknown> }[];
   // Areas the API interacted with (likely important game elements)
-  interactiveAreas: { x: number; y: number; count: number }[];
+  interactiveAreas: { x: number; y: number; count: number; lastTappedTurn: number }[];
   // Detected game category for adaptive fallback
   category: 'joystick' | 'tap' | 'puzzle' | 'drag' | 'unknown';
   // Phase: observe first, then exploit learned patterns
@@ -36,6 +36,14 @@ export interface LearnedKnowledge {
   joystickCenter?: { x: number; y: number };
   // Control scheme discovered from tutorial (e.g. "drag-joystick", "tap-targets", "swipe")
   controlScheme?: string;
+  // Direction memory: last API-directed movement direction
+  lastApiDirection?: { dx: number; dy: number; setAtTurn: number };
+  // API budget pacing
+  lastApiCallTurn: number;
+  fallbackTurnsSinceApi: number;
+  // Screen change detection
+  lastScreenshotHash: number;
+  screenChanged: boolean;
 }
 
 export const gameState: GameState = {
@@ -58,6 +66,10 @@ function createEmptyKnowledge(): LearnedKnowledge {
     category: 'unknown',
     phase: 'observing',
     apiGuidedTurns: 0,
+    lastApiCallTurn: -1,
+    fallbackTurnsSinceApi: 0,
+    lastScreenshotHash: 0,
+    screenChanged: false,
   };
 }
 
@@ -75,14 +87,40 @@ export function resetGameState(url: string, duration: number, runId: string): vo
 }
 
 /** Record what the API chose so fallback can replay similar actions */
-export function learnFromApiAction(fc: { name: string; args: Record<string, unknown> }): void {
+export function learnFromApiAction(fc: { name: string; args: Record<string, unknown> }, turnNumber: number): void {
   const k = gameState.learned;
   k.apiGuidedTurns++;
+
+  // Reset API pacing counters
+  k.lastApiCallTurn = turnNumber;
+  k.fallbackTurnsSinceApi = 0;
+  k.screenChanged = false;
 
   // Store the action
   k.successfulActions.push({ name: fc.name, args: { ...fc.args } });
   // Keep last 20
   if (k.successfulActions.length > 20) k.successfulActions.shift();
+
+  // Extract direction memory from drag actions
+  if (fc.name === 'drag') {
+    const sx = fc.args.startX as number;
+    const sy = fc.args.startY as number;
+    const ex = fc.args.endX as number;
+    const ey = fc.args.endY as number;
+    if (typeof sx === 'number' && typeof ex === 'number') {
+      const rawDx = ex - sx;
+      const rawDy = ey - sy;
+      const mag = Math.sqrt(rawDx * rawDx + rawDy * rawDy);
+      if (mag > 0.02) {
+        // Normalize to standard magnitude ~0.10
+        k.lastApiDirection = {
+          dx: (rawDx / mag) * 0.10,
+          dy: (rawDy / mag) * 0.10,
+          setAtTurn: turnNumber,
+        };
+      }
+    }
+  }
 
   // Track interactive areas
   const x = (fc.args.x as number) ?? (fc.args.startX as number);
@@ -94,7 +132,7 @@ export function learnFromApiAction(fc: { name: string; args: Record<string, unkn
     if (existing) {
       existing.count++;
     } else {
-      k.interactiveAreas.push({ x, y, count: 1 });
+      k.interactiveAreas.push({ x, y, count: 1, lastTappedTurn: -1 });
     }
   }
 
@@ -123,6 +161,26 @@ export function learnFromApiAction(fc: { name: string; args: Record<string, unkn
 
     k.phase = 'playing';
   }
+}
+
+/** Cheap hash of a base64 screenshot — sample chars at fixed intervals */
+export function computeScreenHash(base64: string): number {
+  if (!base64 || base64.length < 256) return 0;
+  let hash = 0;
+  const step = Math.floor(base64.length / 128);
+  for (let i = 0; i < base64.length; i += step) {
+    hash = ((hash << 5) - hash + base64.charCodeAt(i)) | 0;
+  }
+  return hash;
+}
+
+/** Compare new screenshot hash against last, set screenChanged flag */
+export function detectScreenChange(newHash: number): boolean {
+  const k = gameState.learned;
+  const changed = k.lastScreenshotHash !== 0 && k.lastScreenshotHash !== newHash;
+  k.lastScreenshotHash = newHash;
+  if (changed) k.screenChanged = true;
+  return changed;
 }
 
 export function getElapsedMs(): number {
